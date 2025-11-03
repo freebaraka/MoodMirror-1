@@ -202,7 +202,6 @@ class CameraWorker(QtCore.QThread):
         super().__init__(parent)
         self.running = False
         self.capture = None
-        self._face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     def run(self):
         self.capture = cv2.VideoCapture(0)
@@ -234,6 +233,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowIcon(QtGui.QIcon("icon.png"))
         self.setMinimumSize(800, 600)
 
+        # --- Central Widget and Layout ---
+        self.central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.video_label = QtWidgets.QLabel("Starting camera...")
+        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.video_label.setStyleSheet("background-color: black; color: white; font-size: 18px;")
+        layout = QtWidgets.QVBoxLayout(self.central_widget)
+        layout.addWidget(self.video_label)
+
+        # --- Database setup ---
         self.db = Database()
         try:
             self.db.connect()
@@ -241,6 +250,7 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.exception("DB connect failed")
             self.db = None
 
+        # --- Background Threads ---
         self.db_logger = DBLogger(self.db)
         self.db_logger.start()
 
@@ -251,10 +261,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.http_server.start()
 
         self.camera_worker = CameraWorker()
+        self.camera_worker.frame_ready.connect(self.update_frame)
         self.camera_worker.start()
 
+        self.statusBar().showMessage("Camera started...")
+
+    def update_frame(self, frame):
+        """Display live camera feed"""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+        self.video_label.setPixmap(
+            pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        )
+
     def closeEvent(self, event):
-        """Stop all threads cleanly in correct order"""
+        """Stop all threads cleanly"""
         try:
             self.camera_worker.stop()
             self.db_logger.stop()
