@@ -24,9 +24,6 @@ logger = logging.getLogger("MoodMirror")
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 5000
 
-# -------------------------------------------------------
-# Utility: JSON-safe serialization for Flask responses
-# -------------------------------------------------------
 def json_safe(obj):
     if isinstance(obj, (np.floating, np.integer)):
         return float(obj)
@@ -35,7 +32,7 @@ def json_safe(obj):
     return str(obj)
 
 # -------------------------------------------------------
-# MongoDB Database class (simplified)
+# Database
 # -------------------------------------------------------
 class Database:
     def __init__(self, host="localhost", port=27017, database="emoji_tracker", reconnect_attempts=3, reconnect_delay=1.0):
@@ -68,21 +65,6 @@ class Database:
         if self.client is None:
             self.connect()
 
-    def log_mood(self, mood, confidence=0.0, duration=0.0, timestamp=None):
-        self._ensure_connection()
-        if not self.db:
-            return False
-        if timestamp is None:
-            timestamp = datetime.now()
-        doc = {"mood": mood, "confidence": float(confidence), "duration": float(duration), "timestamp": timestamp}
-        try:
-            with self.lock:
-                self.db.moods.insert_one(doc)
-            return True
-        except Exception as e:
-            logging.error("Failed to log mood: %s", e)
-            return False
-
     def log_face_mood(self, person_name, emotion, confidence=0.0, duration=0.0, timestamp=None):
         self._ensure_connection()
         if not self.db:
@@ -99,25 +81,13 @@ class Database:
             logging.error("Failed to log face mood: %s", e)
             return False
 
-    def get_recent_face_moods(self, minutes=60, limit=1000):
-        self._ensure_connection()
-        if not self.db:
-            return []
-        try:
-            cutoff = datetime.now() - timedelta(minutes=minutes)
-            cursor = self.db.face_moods.find({"timestamp": {"$gte": cutoff}}).sort("timestamp", -1).limit(limit)
-            return list(cursor)
-        except Exception as e:
-            logging.error("Failed to get recent face moods: %s", e)
-            return []
-
     def close(self):
         if self.client:
             self.client.close()
             logging.info("MongoDB connection closed.")
 
 # -------------------------------------------------------
-# TTS (Text-to-Speech)
+# Threads: TTS, DBLogger, HttpServer
 # -------------------------------------------------------
 class TTS(threading.Thread):
     def __init__(self):
@@ -146,9 +116,7 @@ class TTS(threading.Thread):
         except Exception:
             pass
 
-# -------------------------------------------------------
-# Database Logger Thread
-# -------------------------------------------------------
+
 class DBLogger(threading.Thread):
     def __init__(self, db):
         super().__init__(daemon=True)
@@ -171,9 +139,7 @@ class DBLogger(threading.Thread):
     def stop(self):
         self.running = False
 
-# -------------------------------------------------------
-# Flask HTTP server
-# -------------------------------------------------------
+
 class HttpServer(threading.Thread):
     def __init__(self, host, port, db):
         super().__init__(daemon=True)
@@ -186,32 +152,44 @@ class HttpServer(threading.Thread):
     def _build_app(self):
         @self.app.route("/api/recent_face_moods", methods=["GET"])
         def recent_face_moods():
-            rows = self.db.get_recent_face_moods(minutes=60)
-            return jsonify(json.loads(json.dumps(rows, default=json_safe)))
+            rows = self.db.db.face_moods.find().sort("timestamp", -1).limit(20)
+            return jsonify(json.loads(json.dumps(list(rows), default=json_safe)))
 
     def run(self):
         self.app.run(host=self.host, port=self.port, threaded=True)
 
 # -------------------------------------------------------
-# Camera thread (simplified)
+# Camera Worker
 # -------------------------------------------------------
 class CameraWorker(QtCore.QThread):
-    frame_ready = QtCore.pyqtSignal(np.ndarray)
+    frame_ready = QtCore.pyqtSignal(np.ndarray, dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.running = False
         self.capture = None
+        self.last_analysis = time.time()
 
     def run(self):
         self.capture = cv2.VideoCapture(0)
         self.running = True
         while self.running:
             ret, frame = self.capture.read()
-            if ret:
-                self.frame_ready.emit(frame)
-            else:
+            if not ret:
                 time.sleep(0.05)
+                continue
+
+            emotion_data = {}
+            now = time.time()
+            if now - self.last_analysis > 3:  # analyze every 3 seconds
+                try:
+                    result = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
+                    emotion_data = result[0] if isinstance(result, list) else result
+                    self.last_analysis = now
+                except Exception as e:
+                    logging.warning("DeepFace analysis failed: %s", e)
+
+            self.frame_ready.emit(frame, emotion_data)
 
     def stop(self):
         self.running = False
@@ -224,25 +202,42 @@ class CameraWorker(QtCore.QThread):
             pass
 
 # -------------------------------------------------------
-# GUI Main Window
+# Main Window - Camera + Mood Image + Text
 # -------------------------------------------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Mood Mirror")
-        self.setWindowIcon(QtGui.QIcon("icon.png"))
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(950, 700)
 
-        # --- Central Widget and Layout ---
-        self.central_widget = QtWidgets.QWidget()
-        self.setCentralWidget(self.central_widget)
+        # --- Layout ---
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        # Horizontal split: camera + mood image
+        hbox = QtWidgets.QHBoxLayout()
+        layout.addLayout(hbox, stretch=4)
+
+        # Camera feed
         self.video_label = QtWidgets.QLabel("Starting camera...")
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
         self.video_label.setStyleSheet("background-color: black; color: white; font-size: 18px;")
-        layout = QtWidgets.QVBoxLayout(self.central_widget)
-        layout.addWidget(self.video_label)
+        hbox.addWidget(self.video_label, stretch=3)
 
-        # --- Database setup ---
+        # Mood image
+        self.mood_image = QtWidgets.QLabel()
+        self.mood_image.setAlignment(QtCore.Qt.AlignCenter)
+        self.mood_image.setStyleSheet("background-color: #222;")
+        hbox.addWidget(self.mood_image, stretch=1)
+
+        # Emotion text below
+        self.emotion_label = QtWidgets.QLabel("Detecting emotion...")
+        self.emotion_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.emotion_label.setStyleSheet("font-size: 24px; font-weight: bold; color: cyan; margin-top: 10px;")
+        layout.addWidget(self.emotion_label, stretch=1)
+
+        # --- Threads ---
         self.db = Database()
         try:
             self.db.connect()
@@ -250,7 +245,6 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.exception("DB connect failed")
             self.db = None
 
-        # --- Background Threads ---
         self.db_logger = DBLogger(self.db)
         self.db_logger.start()
 
@@ -261,13 +255,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.http_server.start()
 
         self.camera_worker = CameraWorker()
-        self.camera_worker.frame_ready.connect(self.update_frame)
+        self.camera_worker.frame_ready.connect(self.update_display)
         self.camera_worker.start()
 
-        self.statusBar().showMessage("Camera started...")
+        self.statusBar().showMessage("Camera running...")
 
-    def update_frame(self, frame):
-        """Display live camera feed"""
+        # Cache for last emotion to avoid repeating same TTS
+        self.last_emotion = None
+
+    def update_display(self, frame, emotion_data):
+        """Display camera, text, and mood image"""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -277,8 +274,28 @@ class MainWindow(QtWidgets.QMainWindow):
             pix.scaled(self.video_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         )
 
+        if emotion_data:
+            dominant = emotion_data.get("dominant_emotion", "Unknown").capitalize()
+            confidence = emotion_data.get("emotion", {}).get(dominant.lower(), 0)
+            self.emotion_label.setText(f"Detected Emotion: {dominant} ({confidence:.1f}%)")
+
+            # Load corresponding mood image
+            image_path = f"{dominant.lower()}.png"
+            if os.path.exists(image_path):
+                pixmap = QtGui.QPixmap(image_path)
+                self.mood_image.setPixmap(
+                    pixmap.scaled(self.mood_image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                )
+            else:
+                self.mood_image.clear()
+
+            # Speak & log only if emotion changed
+            if dominant != self.last_emotion:
+                self.tts.speak(f"You look {dominant}")
+                self.db_logger.enqueue_face_mood("User", dominant, float(confidence), 0)
+                self.last_emotion = dominant
+
     def closeEvent(self, event):
-        """Stop all threads cleanly"""
         try:
             self.camera_worker.stop()
             self.db_logger.stop()
@@ -289,8 +306,6 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         event.accept()
 
-# -------------------------------------------------------
-# Entry Point
 # -------------------------------------------------------
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
